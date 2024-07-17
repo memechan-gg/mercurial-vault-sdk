@@ -1,4 +1,4 @@
-import { AnchorProvider, Program, BN } from '@project-serum/anchor';
+import { AnchorProvider, Program, BN } from '@coral-xyz/anchor';
 import {
   PublicKey,
   TransactionInstruction,
@@ -8,7 +8,7 @@ import {
   SYSVAR_RENT_PUBKEY,
   SystemProgram,
 } from '@solana/web3.js';
-import { MintLayout, TOKEN_PROGRAM_ID, u64, NATIVE_MINT } from '@solana/spl-token';
+import { MintLayout, TOKEN_PROGRAM_ID, NATIVE_MINT } from '@solana/spl-token';
 import { TokenInfo } from '@solana/spl-token-registry';
 
 import { AffiliateInfo, AffiliateVaultProgram, VaultImplementation, VaultProgram, VaultState } from './types';
@@ -25,7 +25,6 @@ import {
   wrapSOLInstruction,
 } from './utils';
 import { AFFILIATE_PROGRAM_ID, PROGRAM_ID, SEEDS, VAULT_BASE_KEY, VAULT_STRATEGY_ADDRESS } from './constants';
-import { getStrategyHandler, getStrategyType, StrategyState } from './strategy';
 import { IDL, Vault as VaultIdl } from './idl';
 import { IDL as AffiliateIDL, AffiliateVault as AffiliateVaultIdl } from './affiliate-idl';
 import { calculateWithdrawableAmount } from './helper';
@@ -70,7 +69,7 @@ const getAllVaultState = async (tokenInfos: Array<TokenInfo>, program: VaultProg
     if (!vaultAccountPda) throw new Error('Missing vault account pda');
     const vaultLpAccount = vaultLpAccounts[index];
     if (!vaultLpAccount) throw new Error('Missing vault lp account');
-    const lpSupply = new BN(u64.fromBuffer(MintLayout.decode(vaultLpAccount.data).supply));
+    const lpSupply = new BN(MintLayout.decode(vaultLpAccount.data).supply.toString());
 
     return { ...vaultAccountPda, vaultState, lpSupply };
   });
@@ -92,7 +91,7 @@ const getAllVaultStateByPda = async (tokensInfoPda: Array<TokenInfoPda>, program
     if (!vaultAccountPda) throw new Error('Missing vault account pda');
     const vaultLpAccount = vaultLpAccounts[index];
     if (!vaultLpAccount) throw new Error('Missing vault lp account');
-    const lpSupply = new BN(u64.fromBuffer(MintLayout.decode(vaultLpAccount.data).supply));
+    const lpSupply = new BN(MintLayout.decode(vaultLpAccount.data).supply.toString());
 
     return { ...vaultAccountPda, vaultState, lpSupply };
   });
@@ -131,7 +130,7 @@ const getVaultLiquidity = async (connection: Connection, tokenVaultPda: PublicKe
   const vaultLiquidityResponse = await connection.getAccountInfo(tokenVaultPda);
   if (!vaultLiquidityResponse) return null;
 
-  const vaultLiquiditySerialize = deserializeAccount(vaultLiquidityResponse.data);
+  const vaultLiquiditySerialize = deserializeAccount(vaultLiquidityResponse);
   return vaultLiquiditySerialize?.amount.toString() || null;
 };
 
@@ -181,6 +180,7 @@ export default class VaultImpl implements VaultImplementation {
     this.vaultState = vaultDetails.vaultState;
     this.lpSupply = vaultDetails.lpSupply;
   }
+  // withdraw: (owner: PublicKey, baseTokenAmount: BN) => Promise<Transaction | { error: string }>;
 
   public static async createPermissionlessVaultInstruction(
     connection: Connection,
@@ -228,10 +228,10 @@ export default class VaultImpl implements VaultImplementation {
     return accountsInfo.map((accountInfo) => {
       if (!accountInfo) return new BN(0);
 
-      const accountBalance = deserializeAccount(accountInfo.data);
+      const accountBalance = deserializeAccount(accountInfo);
       if (!accountBalance) throw new Error('Failed to parse user account for LP token.');
 
-      return new BN(accountBalance.amount);
+      return new BN(accountBalance.amount.toString());
     });
   }
 
@@ -361,12 +361,12 @@ export default class VaultImpl implements VaultImplementation {
       return new BN(0);
     }
 
-    const result = deserializeAccount(accountInfo.data);
+    const result = deserializeAccount(accountInfo);
     if (result == undefined) {
       throw new Error('Failed to parse user account for LP token.');
     }
 
-    return new BN(result.amount);
+    return new BN(result.amount.toString());
   }
 
   /** To refetch the latest lpSupply */
@@ -557,211 +557,6 @@ export default class VaultImpl implements VaultImplementation {
         .transaction();
     }
     return new Transaction({ feePayer: owner, ...(await this.connection.getLatestBlockhash()) }).add(depositTx);
-  }
-
-  public async getStrategiesState(): Promise<Array<StrategyState>> {
-    return (
-      await this.program.account.strategy.fetchMultiple(
-        this.vaultState.strategies.filter((address) => address.toString() !== VAULT_STRATEGY_ADDRESS),
-      )
-    ).filter(Boolean);
-  }
-
-  private async getStrategyWithHighestLiquidity(strategy?: PublicKey) {
-    // Reserved for testing
-    if (strategy) {
-      const strategyState = (await this.program.account.strategy.fetchNullable(strategy)) as unknown as StrategyState;
-      return { publicKey: strategy, strategyState };
-    }
-
-    const vaultStrategiesStatePromise = this.vaultState.strategies
-      .filter((address) => address.toString() !== VAULT_STRATEGY_ADDRESS)
-      .map(async (strat) => {
-        const strategyState = (await this.program.account.strategy.fetch(strat)) as unknown as StrategyState;
-        return { publicKey: strat, strategyState };
-      });
-    const vaultStrategiesState = await Promise.allSettled(vaultStrategiesStatePromise);
-    const settledVaultStrategiesState = vaultStrategiesState
-      .map((item) => (item.status === 'fulfilled' ? item.value : undefined))
-      .filter(Boolean);
-
-    const highestLiquidity = settledVaultStrategiesState.sort((a, b) =>
-      b.strategyState.currentLiquidity.sub(a.strategyState.currentLiquidity).toNumber(),
-    )[0];
-    return highestLiquidity;
-  }
-
-  public async withdraw(owner: PublicKey, baseTokenAmount: BN, opt?: { strategy?: PublicKey }): Promise<Transaction> {
-    // Refresh vault state
-    await this.refreshVaultState();
-    const lpSupply = await this.getVaultSupply();
-
-    let preInstructions: TransactionInstruction[] = [];
-    let userToken: PublicKey | undefined;
-    let userLpToken: PublicKey | undefined;
-    let withdrawOpt: WithdrawOpt | undefined;
-
-    // Withdraw with Affiliate
-    if (this.affiliateId && this.affiliateProgram) {
-      const {
-        preInstructions: preInstructionsATA,
-        partnerAddress,
-        userAddress,
-        userToken: userTokenATA,
-        userLpToken: userLpTokenATA,
-      } = await this.createAffiliateATAPreInstructions(owner);
-
-      preInstructions = preInstructionsATA;
-      userToken = userTokenATA;
-      userLpToken = userLpTokenATA;
-      withdrawOpt =
-        this.affiliateId && this.affiliateProgram
-          ? {
-              affiliate: {
-                affiliateId: this.affiliateId,
-                affiliateProgram: this.affiliateProgram,
-                partner: partnerAddress,
-                user: userAddress,
-              },
-            }
-          : undefined;
-    } else {
-      // Without affiliate
-      const {
-        preInstructions: preInstructionsATA,
-        userToken: userTokenATA,
-        userLpToken: userLpTokenATA,
-      } = await this.createATAPreInstructions(owner);
-      preInstructions = preInstructionsATA;
-      userToken = userTokenATA;
-      userLpToken = userLpTokenATA;
-    }
-
-    const unlockedAmount = await this.getWithdrawableAmount();
-    const amountToWithdraw = baseTokenAmount.mul(unlockedAmount).div(lpSupply);
-    const vaultLiquidity = new BN((await getVaultLiquidity(this.connection, this.tokenVaultPda)) || 0);
-
-    if (
-      amountToWithdraw.lt(vaultLiquidity) // If withdraw amount lesser than vault reserve
-    ) {
-      return this.withdrawFromVaultReserve(
-        owner,
-        baseTokenAmount,
-        userToken,
-        userLpToken,
-        preInstructions,
-        withdrawOpt,
-      );
-    }
-
-    // Get strategy with highest liquidity
-    // opt.strategy reserved for testing
-    const selectedStrategy = await this.getStrategyWithHighestLiquidity(opt?.strategy);
-
-    const currentLiquidity = new BN(selectedStrategy.strategyState.currentLiquidity);
-    const availableAmount = currentLiquidity.add(vaultLiquidity);
-
-    if (amountToWithdraw.gt(availableAmount)) {
-      throw new Error('Selected strategy does not have enough liquidity.');
-    }
-
-    const strategyType = getStrategyType(selectedStrategy.strategyState.strategyType);
-    const strategyHandler = getStrategyHandler(strategyType, this.cluster, this.program);
-
-    if (!strategyType || !strategyHandler) {
-      throw new Error('Cannot find strategy handler');
-    }
-
-    // Unwrap SOL
-    const postInstruction: Array<TransactionInstruction> = [];
-    if (this.tokenInfo.address === NATIVE_MINT.toString()) {
-      const closeWrappedSOLIx = await unwrapSOLInstruction(owner);
-      if (closeWrappedSOLIx) {
-        postInstruction.push(closeWrappedSOLIx);
-      }
-    }
-
-    const withdrawFromStrategyTx = await strategyHandler.withdraw(
-      owner,
-      this.program,
-      {
-        pubkey: selectedStrategy.publicKey,
-        state: selectedStrategy.strategyState,
-      },
-      this.vaultPda,
-      this.tokenVaultPda,
-      this.vaultState,
-      userToken,
-      userLpToken,
-      baseTokenAmount,
-      preInstructions,
-      postInstruction,
-      withdrawOpt,
-    );
-
-    const tx = new Transaction({ feePayer: owner, ...(await this.connection.getLatestBlockhash()) }).add(
-      withdrawFromStrategyTx,
-    );
-
-    return tx;
-  }
-
-  // Reserved code to withdraw from Vault Reserves directly.
-  // The only situation this piece of code will be required, is when a single Vault have no other strategy, and only have its own reserve.
-  private async withdrawFromVaultReserve(
-    owner: PublicKey,
-    baseTokenAmount: BN,
-    userToken: PublicKey,
-    userLpToken: PublicKey,
-    preInstructions: Array<TransactionInstruction>,
-    withdrawOpt?: WithdrawOpt,
-  ): Promise<Transaction> {
-    // Unwrap SOL
-    const postInstruction: Array<TransactionInstruction> = [];
-    if (this.tokenInfo.address === NATIVE_MINT.toString()) {
-      const closeWrappedSOLIx = await unwrapSOLInstruction(owner);
-      if (closeWrappedSOLIx) {
-        postInstruction.push(closeWrappedSOLIx);
-      }
-    }
-
-    let withdrawTx;
-    if (withdrawOpt?.affiliate) {
-      withdrawTx = await withdrawOpt.affiliate.affiliateProgram.methods
-        .withdraw(baseTokenAmount, new BN(0))
-        .accounts({
-          vault: this.vaultPda,
-          tokenVault: this.tokenVaultPda,
-          vaultLpMint: this.vaultState.lpMint,
-          partner: withdrawOpt.affiliate.partner,
-          owner,
-          userToken,
-          vaultProgram: this.program.programId,
-          userLp: userLpToken,
-          user: withdrawOpt.affiliate.user,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .preInstructions(preInstructions)
-        .postInstructions(postInstruction)
-        .transaction();
-    } else {
-      withdrawTx = await this.program.methods
-        .withdraw(baseTokenAmount, new BN(0)) // Vault does not have slippage, second parameter is ignored.
-        .accounts({
-          vault: this.vaultPda,
-          tokenVault: this.tokenVaultPda,
-          lpMint: this.vaultState.lpMint,
-          userToken,
-          userLp: userLpToken,
-          user: owner,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .preInstructions(preInstructions)
-        .postInstructions(postInstruction)
-        .transaction();
-    }
-
-    return new Transaction({ feePayer: owner, ...(await this.connection.getLatestBlockhash()) }).add(withdrawTx);
   }
 
   public async getAffiliateInfo(): Promise<AffiliateInfo> {
